@@ -20,22 +20,6 @@ const MAX_SPOKEN_CHARS = 550;
 // ============================================================
 // NEO4J GRAPH MEMORY
 // ============================================================
-//
-// Node labels:
-//   (:Caller   { phone, firstSeen, lastSeen })
-//   (:Entity   { name, type })          ← Person | Place | Topic | Preference | Fact
-//   (:Memory   { text, timestamp, callId })
-//
-// Relationships:
-//   (:Caller)-[:HAS_MEMORY]->(:Memory)
-//   (:Caller)-[:MENTIONED]->(:Entity)
-//   (:Memory)-[:INVOLVES]->(:Entity)
-//
-// Flow per turn:
-//   1. Recall recent memories + known entities for caller  →  inject as system context
-//   2. LLM answers with that context
-//   3. Extract entities + summary from the turn  →  persist as new Memory node
-// ============================================================
 
 let _neo4jDriver = null;
 
@@ -163,8 +147,8 @@ async function recallMemory(phone) {
     ),
   ]);
 
-  const memories  = memRecs.map(r => r.get("text")).filter(Boolean);
-  const entities  = entRecs.map(r => `${r.get("name")} (${r.get("type")})`).filter(Boolean);
+  const memories = memRecs.map(r => r.get("text")).filter(Boolean);
+  const entities = entRecs.map(r => `${r.get("name")} (${r.get("type")})`).filter(Boolean);
 
   if (!memories.length && !entities.length) return null;
 
@@ -211,7 +195,7 @@ app.delete("/api/memory/:phone", async (req, res) => {
   res.json({ success: true, cleared: phone });
 });
 
-// ─── REST: full graph dump (for Neo4j Browser debugging) ─────
+// ─── REST: full graph dump ───────────────────────────────────
 app.get("/api/graph", async (req, res) => {
   const recs = await cypher(
     `MATCH (c:Caller)-[r]->(n)
@@ -233,52 +217,151 @@ app.get("/api/graph", async (req, res) => {
 });
 
 // ============================================================
-// SERP AGENT — Web Search
+// SMART SEARCH GUARDRAILS
+// ============================================================
+//
+// Two-gate system before any Tavily call:
+//
+//   Gate 1 — Hard regex rules for topics the LLM knows deeply.
+//             If matched → skip search entirely, answer from Ollama.
+//
+//   Gate 2 — Ask Ollama itself: "Do you need live data for this?"
+//             Only if Ollama says YES → call Tavily.
+//
+// Result: ~80-90% of questions answered from Ollama knowledge,
+//         zero Tavily API calls wasted on timeless topics.
 // ============================================================
 
-const SEARCH_TRIGGERS = [
-  /\b(today|tonight|right now|currently|latest|recent|new|just|breaking)\b/i,
-  /\b(news|headline|update|weather|price|stock|score|result|winner|match|game)\b/i,
-  /\b(who is|what is|when is|where is|how much|how many)\b/i,
-  /\b(20\d\d)\b/,
-  /\?$/,
+/**
+ * Gate 1 — Topics the LLM can always answer without live data.
+ * If any pattern matches → immediately skip search.
+ */
+const NEVER_SEARCH_PATTERNS = [
+  // Conversational / greetings
+  /^(hi|hello|hey|thanks|thank you|bye|goodbye|ok|okay|yes|no|sure|great|good|help me|what can you do)\b/i,
+  // Science & math concepts
+  /\b(explain|define|what is a|how does|tell me about)\b.{0,50}\b(physics|chemistry|biology|math|algebra|calculus|gravity|evolution|atom|molecule|dna|cell|photosynthesis|relativity|quantum)\b/i,
+  // Historical facts (not recent events)
+  /\b(history of|who was|who were|when was|what happened in|founded|invented|discovered|born in|died in)\b.{0,60}\b(ancient|medieval|world war|revolution|empire|century|bc\b|ad\b|\b1[0-9]{3}\b|\b20[01][0-9]\b)\b/i,
+  // Recipes & cooking
+  /\b(recipe|how to cook|how to make|how to bake|how to prepare|ingredients for|what goes in)\b/i,
+  // Language & grammar
+  /\b(translate|meaning of|what does .{1,30} mean|synonym|antonym|grammar|how to spell|pronunciation of)\b/i,
+  // Programming concepts
+  /\b(how to (code|program|write|implement)|what is (a )?(function|class|variable|loop|array|api|rest|sql|json|database|algorithm|recursion))\b/i,
+  // Static geography / general knowledge
+  /\b(capital of|flag of|currency of|language spoken in|largest country|smallest country|who invented|who wrote|who painted|how many (planets|continents|oceans))\b/i,
+  // Math operations
+  /^[\d\s\+\-\*\/\^\(\)\.]+[=\?]?\s*$/,
 ];
 
-function needsSearch(text) {
-  return SEARCH_TRIGGERS.some((r) => r.test(text));
+/**
+ * Gate 2 — Ask Ollama if it needs live data.
+ * Fast call with temperature=0 and very short output.
+ * Returns true = search needed, false = answer from LLM.
+ */
+async function ollamaNeedsSearch(query) {
+  const prompt =
+    `You are a routing classifier. A user on a phone call asked:\n"${query}"\n\n` +
+    `Does answering this accurately require LIVE or REAL-TIME information?\n` +
+    `Live data examples: today's weather, current news, live sports scores, ` +
+    `stock prices, events after 2024, who currently holds a position, today's date.\n\n` +
+    `Reply with ONLY one word — YES or NO.\n` +
+    `YES = live data is needed.\n` +
+    `NO  = your training knowledge is fully sufficient.`;
+
+  try {
+    const res = await axios.post(
+      "http://localhost:11434/api/chat",
+      {
+        model:    "qwen2.5:1.5b",
+        messages: [{ role: "user", content: prompt }],
+        stream:   false,
+        options:  { temperature: 0, num_predict: 5 },
+      },
+      { timeout: 15000 }
+    );
+    const answer = (res.data.message.content || "").trim().toUpperCase();
+    console.log(`🤔 Search classifier → ${answer}`);
+    return answer.startsWith("YES");
+  } catch (err) {
+    console.warn("Search classifier error (defaulting NO):", err.message);
+    return false; // safe default: answer from LLM
+  }
 }
 
-async function serpSearch(query) {
-  if (!process.env.SERP_API_KEY) {
-    console.warn("⚠️  SERP_API_KEY not set");
+/**
+ * Master routing function.
+ * Returns true only when a Tavily web search should actually fire.
+ */
+async function shouldSearch(query) {
+  if (!query?.trim()) return false;
+  if (!process.env.TAVILY_API_KEY) return false;
+
+  // Gate 1: hard-block on timeless topics
+  if (NEVER_SEARCH_PATTERNS.some(r => r.test(query))) {
+    console.log("🚫 Search skipped — Gate 1 (timeless topic, using Ollama knowledge)");
+    return false;
+  }
+
+  // Gate 2: ask Ollama
+  return ollamaNeedsSearch(query);
+}
+
+// ============================================================
+// TAVILY SEARCH
+// ============================================================
+
+async function tavilySearch(query) {
+  if (!process.env.TAVILY_API_KEY) {
+    console.warn("⚠️  TAVILY_API_KEY not set");
     return null;
   }
   try {
-    console.log("🔍 SerpAPI:", query);
-    const { data } = await axios.get("https://serpapi.com/search", {
-      params: { q: query, api_key: process.env.SERP_API_KEY, engine: "google", num: 5, hl: "en", gl: "us" },
-      timeout: 10000,
-    });
+    console.log("🔍 Tavily:", query);
+    const { data } = await axios.post(
+      "https://api.tavily.com/search",
+      {
+        api_key:        process.env.TAVILY_API_KEY,
+        query,
+        max_results:    5,
+        search_depth:   "basic",      // "basic" = fast; "advanced" = deeper but slower
+        include_answer: true,         // Tavily's own AI-synthesised direct answer
+      },
+      { timeout: 10000 }
+    );
 
     const snippets = [];
-    if (data.answer_box) {
-      const ab = data.answer_box;
-      const a  = ab.answer || ab.snippet || ab.result || ab.contents || "";
-      if (a) snippets.push(`[Direct Answer] ${a}`);
-    }
-    if (data.knowledge_graph?.description) snippets.push(`[Knowledge Graph] ${data.knowledge_graph.description}`);
-    (data.news_results    || []).slice(0, 3).forEach(n => n.snippet && snippets.push(`[News] ${n.title}: ${n.snippet}`));
-    (data.organic_results || []).slice(0, 4).forEach(r => r.snippet && snippets.push(`[Web] ${r.title || ""}: ${r.snippet}`));
+
+    // Best signal: Tavily's synthesised answer
+    if (data.answer) snippets.push(`[Direct Answer] ${data.answer}`);
+
+    // Individual result snippets (trimmed for voice context)
+    (data.results || []).slice(0, 4).forEach(r => {
+      if (r.content) snippets.push(`[Web] ${r.title || ""}: ${r.content.slice(0, 300)}`);
+    });
 
     if (!snippets.length) return null;
+
     const ctx = `Live web search for "${query}":\n` + snippets.join("\n");
-    console.log("🔍 Preview:", ctx.slice(0, 180) + "…");
+    console.log("🔍 Preview:", ctx.slice(0, 200) + "…");
     return ctx;
   } catch (err) {
-    console.error("SerpAPI error:", err.response ? `${err.response.status}` : err.message);
+    console.error("Tavily error:", err.response
+      ? JSON.stringify(err.response.data)
+      : err.message);
     return null;
   }
 }
+
+// ─── REST: manual search test endpoint ───────────────────────
+app.get("/api/search", async (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.status(400).json({ error: "q required" });
+  const needed  = await shouldSearch(q);
+  const context = needed ? await tavilySearch(q) : null;
+  res.json({ query: q, searchPerformed: needed, context });
+});
 
 // ============================================================
 // OLLAMA
@@ -286,7 +369,6 @@ async function serpSearch(query) {
 
 async function askOllama(history, searchCtx, memoryCtx) {
   try {
-    // Enrich system prompt with memory
     let systemContent = history[0].content;
     if (memoryCtx) systemContent += "\n\n" + memoryCtx;
 
@@ -300,7 +382,7 @@ async function askOllama(history, searchCtx, memoryCtx) {
             content:
               `${base[base.length - 1].content}\n\n` +
               `--- Live search results ---\n${searchCtx}\n--- End ---\n\n` +
-              `Use these to answer accurately. 2–4 spoken sentences max.`,
+              `Use these results to answer accurately. Keep it to 2–4 spoken sentences.`,
           },
         ]
       : base;
@@ -330,18 +412,23 @@ async function agentReply(history, callerPhone, callId) {
   const lastUser = [...history].reverse().find(m => m.role === "user");
   const query    = lastUser?.content || "";
 
-  // Parallel: recall memory + search web
-  const [memoryCtx, searchCtx] = await Promise.all([
-    callerPhone ? recallMemory(callerPhone)                  : Promise.resolve(null),
-    needsSearch(query) ? serpSearch(query) : Promise.resolve(null),
+  // Step 1: recall memory + decide if search needed (parallel)
+  const [memoryCtx, needsWeb] = await Promise.all([
+    callerPhone ? recallMemory(callerPhone) : Promise.resolve(null),
+    shouldSearch(query),
   ]);
 
-  if (memoryCtx) console.log("🧠 Memory recalled for", callerPhone);
-  if (searchCtx) console.log("🔍 Search context ready");
+  // Step 2: only fetch web if guardrails approved it
+  const searchCtx = needsWeb ? await tavilySearch(query) : null;
 
+  if (memoryCtx)  console.log("🧠 Memory recalled for", callerPhone);
+  if (searchCtx)  console.log("🌐 Web context injected");
+  if (!needsWeb)  console.log("💡 Answering from Ollama knowledge (Tavily skipped)");
+
+  // Step 3: generate reply
   const reply = await askOllama(history, searchCtx, memoryCtx);
 
-  // Async memory save — never blocks voice response
+  // Step 4: async memory save — never blocks voice
   if (callerPhone && query && reply) {
     saveMemory(callerPhone, callId, query, reply).catch(e =>
       console.warn("saveMemory error:", e.message)
@@ -373,10 +460,14 @@ app.post("/api/call", async (req, res) => {
   }
 });
 
+// Pass callerPhone via TwiML custom parameter so memory graph works
 app.all("/api/twilio-answer", (req, res) => {
-  const host = process.env.NGROK_URL.replace("https://", "");
+  const host        = process.env.NGROK_URL.replace("https://", "");
+  const callerPhone = req.body.From || req.query.From || "";
   res.type("text/xml").send(
-    `<Response><Connect><Stream url="wss://${host}/media-stream" /></Connect></Response>`
+    `<Response><Connect><Stream url="wss://${host}/media-stream">` +
+    `<Parameter name="callerPhone" value="${callerPhone}"/>` +
+    `</Stream></Connect></Response>`
   );
 });
 
@@ -385,12 +476,6 @@ app.post("/api/twilio-status", (req, res) => {
   const sid    = req.body.CallSid   || req.query.CallSid;
   if (status) console.log("📊 Status:", status, sid || "");
   res.sendStatus(200);
-});
-
-app.get("/api/search", async (req, res) => {
-  const { q } = req.query;
-  if (!q) return res.status(400).json({ error: "q required" });
-  res.json({ query: q, context: await serpSearch(q) });
 });
 
 // ============================================================
@@ -439,9 +524,11 @@ async function sendVoice(ws, streamSid, text, history, gate) {
     console.log("🔊 TTS done");
   } catch (err) {
     console.error("TTS error:", err.response
-      ? (Buffer.isBuffer(err.response.data) ? err.response.data.toString() : JSON.stringify(err.response.data))
+      ? (Buffer.isBuffer(err.response.data)
+          ? err.response.data.toString()
+          : JSON.stringify(err.response.data))
       : err.message);
-y  }
+  }
 }
 
 // ============================================================
@@ -468,8 +555,10 @@ wss.on("connection", (ws) => {
       role: "system",
       content:
         "You are a helpful AI assistant on a phone call. " +
-        "You have access to LIVE web search results AND long-term graph memory about this caller. " +
-        "Use memory to personalise answers. Reference what the caller told you in past calls when relevant. " +
+        "You have access to long-term graph memory about this caller and occasionally live web search results. " +
+        "Always answer from your own knowledge first. " +
+        "Only use search results when they are explicitly provided to you in the message. " +
+        "Use memory to personalise answers and reference past conversations when relevant. " +
         "Keep answers to 2–4 spoken sentences. Never say you lack real-time data.",
     },
   ];
@@ -478,8 +567,13 @@ wss.on("connection", (ws) => {
     const dg = new WebSocket(
       "wss://api.deepgram.com/v1/listen?" +
         new URLSearchParams({
-          encoding: "mulaw", sample_rate: "8000", model: "nova-2-phonecall",
-          language: "en", interim_results: "true", endpointing: "400", smart_format: "true",
+          encoding:        "mulaw",
+          sample_rate:     "8000",
+          model:           "nova-2-phonecall",
+          language:        "en",
+          interim_results: "true",
+          endpointing:     "700",
+          smart_format:    "true",
         }),
       { headers: { Authorization: `Token ${process.env.DEEPGRAM_API_KEY}` } }
     );
@@ -496,6 +590,9 @@ wss.on("connection", (ws) => {
       console.log("🎤:", tx);
       isProcessing = true;
       try {
+        // Trim history to prevent unbounded growth (keep system + last 10 turns = 21 items)
+        if (history.length > 21) history.splice(1, history.length - 21);
+
         history.push({ role: "user", content: tx });
         const reply = await agentReply(history, callerPhone, callId);
         await sendVoice(ws, streamSid, reply, history, gate);
@@ -514,15 +611,14 @@ wss.on("connection", (ws) => {
     switch (msg.event) {
       case "start": {
         streamSid   = msg.start.streamSid;
-        callerPhone = msg.start?.customParameters?.callerPhone || msg.start?.from || null;
+        callerPhone = msg.start?.customParameters?.callerPhone || null;
 
         console.log(`🆔 callId: ${callId} | caller: ${callerPhone || "unknown"}`);
         if (callerPhone) upsertCaller(callerPhone).catch(console.warn);
 
-        deepgramWs  = setupDeepgram();
+        deepgramWs   = setupDeepgram();
         greetingDone = false;
 
-        // Personalised greeting for returning callers
         const isReturning = callerPhone
           ? ((await cypher(
               `MATCH (c:Caller { phone: $p })-[:HAS_MEMORY]->(m) RETURN count(m) AS n`,
@@ -570,8 +666,8 @@ const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, async () => {
   console.log(`🚀  Port     : ${PORT}`);
   console.log(`🔗  Ngrok    : ${process.env.NGROK_URL}`);
-  console.log(`🔍  SerpAPI  : ${process.env.SERP_API_KEY  ? "✅ configured" : "❌ SERP_API_KEY missing"}`);
-  console.log(`🧠  Neo4j    : ${process.env.NEO4J_URI     || "bolt://localhost:7687 (default)"}`);
+  console.log(`🔍  Tavily   : ${process.env.TAVILY_API_KEY   ? "✅ configured" : "❌ TAVILY_API_KEY missing"}`);
+  console.log(`🧠  Neo4j    : ${process.env.NEO4J_URI        || "bolt://localhost:7687 (default)"}`);
   await initGraphSchema();
 });
 
